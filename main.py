@@ -22,14 +22,15 @@ import logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, max_connections=50)
 
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
 ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
 
 PHONE, OTP, ASK_NAME, ASK_TAG, ASK_SEARCH = range(5)
 
-executor = ThreadPoolExecutor(max_workers=5)
+# افزایش ظرفیت تردها برای پردازش موازی پرسرعت
+executor = ThreadPoolExecutor(max_workers=30)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
@@ -81,13 +82,28 @@ def is_admin(user_id):
 # ==========================================
 # سیستم مدیریت پروکسی و API
 # ==========================================
-async def get_random_proxy_from_db():
+async def get_all_proxies_from_db():
     proxies_json = await redis_client.get("settings:proxies")
     if proxies_json:
-        proxies = json.loads(proxies_json)
-        if proxies and len(proxies) > 0:
-            p = random.choice(proxies)
-            return {"http": p, "https": p}
+        try:
+            proxies = json.loads(proxies_json)
+            if isinstance(proxies, list) and len(proxies) > 0:
+                return proxies
+        except Exception:
+            pass
+    return []
+
+async def get_random_proxy_from_db():
+    proxies = await get_all_proxies_from_db()
+    if proxies:
+        p = random.choice(proxies)
+        return {"http": p, "https": p}
+    return None
+
+def pick_proxy_sync(proxies_list):
+    if proxies_list:
+        p = random.choice(proxies_list)
+        return {"http": p, "https": p}
     return None
 
 def get_user_id_from_token(token):
@@ -110,8 +126,9 @@ def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
         return data
 
 class OkalaAPI:
-    def __init__(self, custom_headers=None):
+    def __init__(self, custom_headers=None, proxies_list=None):
         self.request_logs = []
+        self.proxies_list = proxies_list or []
         if custom_headers:
             self.base_headers = custom_headers.copy()
         else:
@@ -136,7 +153,7 @@ class OkalaAPI:
             f"{'-'*50}\n"
         )
 
-    def make_request(self, method, url, access_token=None, proxy_dict=None, keep_session_ids=False, **kwargs):
+    def make_request(self, method, url, access_token=None, proxy_dict=None, keep_session_ids=False, fast_mode=False, **kwargs):
         headers = self.base_headers.copy()
         if not keep_session_ids:
             headers['X-Correlation-Id'] = str(uuid.uuid4())
@@ -147,37 +164,44 @@ class OkalaAPI:
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
 
+        timeout_val = 12 if fast_mode else 18
+
         for attempt in range(1, 4):
+            # در صورت خطا در تلاش اول، پروکسی جدید از لیست انتخاب شود تا معطل پروکسی خراب نماند
+            current_proxy = proxy_dict if (attempt == 1 and proxy_dict) else (pick_proxy_sync(self.proxies_list) or proxy_dict)
             try:
-                time.sleep(random.uniform(0.8, 2.0))
-                res = requests.request(method, url, headers=headers, proxies=proxy_dict, timeout=25, **kwargs)
-                self.log_request(method, f"{url} (Attempt {attempt})", res.status_code, res.text, proxy_dict)
+                if not fast_mode:
+                    time.sleep(random.uniform(0.1, 0.3))
+                res = requests.request(method, url, headers=headers, proxies=current_proxy, timeout=timeout_val, **kwargs)
+                self.log_request(method, f"{url} (Attempt {attempt})", res.status_code, res.text[:500], current_proxy)
                 if res.status_code == 200:
                     try: return 200, res.json()
                     except: return 200, {}
                 elif res.status_code == 401:
                     return 401, res.text
+                elif res.status_code in [403, 429, 500, 502, 503, 504] and attempt < 3:
+                    continue
                 else:
                     return res.status_code, res.text 
             except Exception as e:
-                self.log_request(method, f"{url} (Attempt {attempt})", "EXCEPTION", str(e), proxy_dict)
-                time.sleep(1)
+                self.log_request(method, f"{url} (Attempt {attempt})", "EXCEPTION", str(e), current_proxy)
+                continue
         return 0, "Network Error (All 3 attempts failed)"
 
-    def check_discount_api(self, token, uid, proxy_dict=None):
+    def check_discount_api(self, token, uid, proxy_dict=None, fast_mode=True):
         url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{uid}"
-        return self.make_request('GET', url, access_token=token, proxy_dict=proxy_dict)
+        return self.make_request('GET', url, access_token=token, proxy_dict=proxy_dict, fast_mode=fast_mode)
 
-    def get_addresses_api(self, token, proxy_dict=None):
+    def get_addresses_api(self, token, proxy_dict=None, fast_mode=True):
         url = "https://apigateway.okala.com/api/v1/accounts/userprofile/getcustomeraddresseswithpaging?pageIndex=1&pageSize=15"
-        return self.make_request('GET', url, access_token=token, proxy_dict=proxy_dict)
+        return self.make_request('GET', url, access_token=token, proxy_dict=proxy_dict, fast_mode=fast_mode)
 
-    def get_orders_api(self, token, proxy_dict=None, keep_session_ids=False):
+    def get_orders_api(self, token, proxy_dict=None, keep_session_ids=False, fast_mode=True):
         url = "https://apigateway.okala.com/api/voyager/C/Order/GetOrders"
         payload = {"pageIndex": 1, "pageSize": 5}
-        return self.make_request('POST', url, access_token=token, proxy_dict=proxy_dict, keep_session_ids=keep_session_ids, json=payload)
+        return self.make_request('POST', url, access_token=token, proxy_dict=proxy_dict, keep_session_ids=keep_session_ids, fast_mode=fast_mode, json=payload)
 
-    def refresh_token(self, refresh_token, proxy_dict=None):
+    def refresh_token(self, refresh_token, proxy_dict=None, fast_mode=True):
         url = "https://apigateway.okala.com/api/v1/accounts/tokens"
         data = {
             "grant_type": "refresh_token",
@@ -186,7 +210,7 @@ class OkalaAPI:
             "scope": "offline_access",
             "refresh_token": refresh_token
         }
-        status, response_data = self.make_request('POST', url, headers={"content-type": "application/x-www-form-urlencoded"}, data=data, proxy_dict=proxy_dict)
+        status, response_data = self.make_request('POST', url, headers={"content-type": "application/x-www-form-urlencoded"}, data=data, proxy_dict=proxy_dict, fast_mode=fast_mode)
         if status == 200 and isinstance(response_data, dict):
             return response_data.get('access_token'), response_data.get('refresh_token')
         return None, None
@@ -216,7 +240,7 @@ def parse_addresses_response(status, response_data):
     return False, False, 0
 
 def check_order_history_sync(api_instance, token, proxy_dict):
-    status, response_data = api_instance.get_orders_api(token, proxy_dict=proxy_dict, keep_session_ids=True)
+    status, response_data = api_instance.get_orders_api(token, proxy_dict=proxy_dict, keep_session_ids=True, fast_mode=False)
     ok, has_orders, count = parse_orders_response(status, response_data)
     return ok, has_orders, count, status, response_data
 
@@ -289,15 +313,15 @@ def format_for_injector(auth_data):
     }
 
 # ==========================================
-# استخراج اکانت‌های خام (بدون خرید و بدون آدرس) از دیتابیس
+# استخراج پرسرعت (موازی) اکانت‌های خام از دیتابیس
 # ==========================================
 async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
     loop = asyncio.get_running_loop()
-    api = OkalaAPI()
+    proxies_list = await get_all_proxies_from_db()
+    api = OkalaAPI(proxies_list=proxies_list)
     ts = int(time.time())
 
-    proxy_check = await get_random_proxy_from_db()
-    if not proxy_check:
+    if not proxies_list:
         await bot.send_message(
             chat_id=chat_id,
             text="⚠️ <b>هیچ پروکسی‌ای در سیستم تنظیم نشده است!</b>\n"
@@ -320,7 +344,7 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
     total = len(acc_keys)
     progress_msg = await bot.send_message(
         chat_id=chat_id,
-        text=f"🧹 شروع اسکن <b>{total}</b> اکانت برای یافتن اکانت‌های خام (بدون خرید و بدون آدرس)...\n⏳ لطفاً منتظر بمانید.",
+        text=f"⚡ شروع اسکن موازی و پرسرعت <b>{total}</b> اکانت (۲۰ اکانت همزمان)...\n⏳ لطفاً منتظر بمانید.",
         parse_mode='HTML'
     )
 
@@ -328,21 +352,24 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
     raw_results = []
     stats = {"raw": 0, "has_address": 0, "has_orders": 0, "failed": 0}
     done = 0
+    last_edit_time = 0
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(20)  # بررسی همزمان ۲۰ اکانت
 
     def _check_raw_sync(acc_token, ref_token, p_dict, phone):
         proxy_ip = mask_proxy(p_dict)
-        log_line = f"[{time.strftime('%H:%M:%S')}] 📱 {phone} | پروکسی: {proxy_ip}\n"
+        log_line = f"[{time.strftime('%H:%M:%S')}] 📱 {phone} | پروکسی اولیه: {proxy_ip}\n"
         new_acc, new_ref = None, None
 
-        # ۱. بررسی آدرس‌ها
-        addr_status, addr_res = api.get_addresses_api(acc_token, proxy_dict=p_dict)
+        # ۱. بررسی سریع آدرس‌ها
+        addr_status, addr_res = api.get_addresses_api(acc_token, proxy_dict=p_dict, fast_mode=True)
         if addr_status == 401 and ref_token:
             log_line += "  ♻️ توکن منقضی — در حال رفرش...\n"
-            new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict)
+            new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict, fast_mode=True)
             if new_acc:
                 acc_token = new_acc
                 log_line += "  ✅ رفرش موفق.\n"
-                addr_status, addr_res = api.get_addresses_api(acc_token, proxy_dict=p_dict)
+                addr_status, addr_res = api.get_addresses_api(acc_token, proxy_dict=p_dict, fast_mode=True)
             else:
                 log_line += "  ❌ رفرش ناموفق.\n"
                 return "failed", new_acc, new_ref, log_line
@@ -356,8 +383,8 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
             log_line += f"  🏠 دارای {addr_count} آدرس ثبت‌شده (رد شد)\n"
             return "has_address", new_acc, new_ref, log_line
 
-        # ۲. بررسی سابقه خرید
-        ord_status, ord_res = api.get_orders_api(acc_token, proxy_dict=p_dict)
+        # ۲. بررسی سریع سابقه خرید
+        ord_status, ord_res = api.get_orders_api(acc_token, proxy_dict=p_dict, fast_mode=True)
         ord_ok, has_ord, ord_count = parse_orders_response(ord_status, ord_res)
         if not ord_ok:
             log_line += f"  ❌ خطا در استعلام سفارشات (کد: {ord_status})\n"
@@ -370,62 +397,74 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
         log_line += "  ✨ اکانت کاملاً خام (بدون آدرس و بدون خرید)\n"
         return "raw", new_acc, new_ref, log_line
 
-    for key in acc_keys:
-        try:
-            phone = key.replace("account:", "")
-            token_data = await redis_client.hgetall(key)
-            access_token = token_data.get("access_token")
-            refresh_token = token_data.get("refresh_token")
+    async def _worker(key):
+        nonlocal done, last_edit_time
+        phone = key.replace("account:", "")
+        async with sem:
+            try:
+                token_data = await redis_client.hgetall(key)
+                access_token = token_data.get("access_token")
+                refresh_token = token_data.get("refresh_token")
 
-            if not access_token:
-                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست.\n")
-                stats["failed"] += 1
-                done += 1
-                continue
+                if not access_token:
+                    async with lock:
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست.\n")
+                        stats["failed"] += 1
+                        done += 1
+                    return
 
-            proxy_dict = await get_random_proxy_from_db()
-            result_state, new_acc, new_ref, log_line = await loop.run_in_executor(
-                executor, _check_raw_sync, access_token, refresh_token, proxy_dict, phone
-            )
-            detail_logs.append(log_line)
+                proxy_dict = pick_proxy_sync(proxies_list)
+                result_state, new_acc, new_ref, log_line = await loop.run_in_executor(
+                    executor, _check_raw_sync, access_token, refresh_token, proxy_dict, phone
+                )
 
-            if new_acc:
-                access_token = new_acc
-                refresh_token = new_ref or refresh_token
-                await redis_client.hset(key, mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                if new_acc:
+                    access_token = new_acc
+                    refresh_token = new_ref or refresh_token
+                    await redis_client.hset(key, mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
 
-            if result_state == "raw":
-                stats["raw"] += 1
-                link = phone_to_latest_link.get(phone)
-                if not link:
-                    auth_data = {"access_token": access_token, "refresh_token": refresh_token or "", "UserInfo": {"MobilePhone": phone}}
-                    injection_json = format_for_injector(auth_data)
-                    link_id = str(uuid.uuid4())[:12]
-                    await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
-                    link = f"{WEB_DOMAIN}/acc/{link_id}"
-                raw_results.append({"phone": phone, "link": link})
-            elif result_state in stats:
-                stats[result_state] += 1
-            else:
-                stats["failed"] += 1
+                link = None
+                if result_state == "raw":
+                    link = phone_to_latest_link.get(phone)
+                    if not link:
+                        auth_data = {"access_token": access_token, "refresh_token": refresh_token or "", "UserInfo": {"MobilePhone": phone}}
+                        injection_json = format_for_injector(auth_data)
+                        link_id = str(uuid.uuid4())[:12]
+                        await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
+                        link = f"{WEB_DOMAIN}/acc/{link_id}"
 
-            done += 1
-            if done % 5 == 0 or done == total:
-                try:
-                    await progress_msg.edit_text(
-                        f"🧹 اسکن اکانت‌های خام...\n"
-                        f"✅ بررسی شده: <b>{done}/{total}</b>\n"
-                        f"✨ خام (بدون خرید و آدرس): <b>{stats['raw']}</b>\n"
-                        f"🏠 دارای آدرس: <b>{stats['has_address']}</b> | 🛍 دارای خرید: <b>{stats['has_orders']}</b>\n"
-                        f"❌ خطا/منقضی: <b>{stats['failed']}</b>",
-                        parse_mode='HTML'
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
-            stats["failed"] += 1
-            done += 1
+                async with lock:
+                    detail_logs.append(log_line)
+                    if result_state == "raw":
+                        stats["raw"] += 1
+                        raw_results.append({"phone": phone, "link": link})
+                    elif result_state in stats:
+                        stats[result_state] += 1
+                    else:
+                        stats["failed"] += 1
+
+                    done += 1
+                    now = time.time()
+                    if (now - last_edit_time >= 2.0) or (done == total):
+                        last_edit_time = now
+                        try:
+                            await progress_msg.edit_text(
+                                f"⚡ اسکن موازی اکانت‌های خام...\n"
+                                f"✅ بررسی شده: <b>{done}/{total}</b>\n"
+                                f"✨ خام (بدون خرید و آدرس): <b>{stats['raw']}</b>\n"
+                                f"🏠 دارای آدرس: <b>{stats['has_address']}</b> | 🛍 دارای خرید: <b>{stats['has_orders']}</b>\n"
+                                f"❌ خطا/منقضی: <b>{stats['failed']}</b>",
+                                parse_mode='HTML'
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                async with lock:
+                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
+                    stats["failed"] += 1
+                    done += 1
+
+    await asyncio.gather(*[_worker(k) for k in acc_keys])
 
     try:
         await progress_msg.delete()
@@ -474,15 +513,15 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
         logging.error(f"Error sending raw scan log: {e}")
 
 # ==========================================
-# پردازش تخفیف‌ها از دیتابیس
+# پردازش پرسرعت (موازی) تخفیف‌ها از دیتابیس
 # ==========================================
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     loop = asyncio.get_running_loop()
-    api = OkalaAPI()
+    proxies_list = await get_all_proxies_from_db()
+    api = OkalaAPI(proxies_list=proxies_list)
     ts = int(time.time())
 
-    proxy_check = await get_random_proxy_from_db()
-    if not proxy_check:
+    if not proxies_list:
         await bot.send_message(
             chat_id=chat_id,
             text="⚠️ <b>هیچ پروکسی‌ای در سیستم تنظیم نشده است!</b>\n"
@@ -503,23 +542,28 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     total = len(acc_keys)
     progress_msg = await bot.send_message(
         chat_id=chat_id,
-        text=f"🔍 شروع بررسی <b>{total}</b> اکانت با پروکسی...\n⏳ لطفاً منتظر بمانید.",
+        text=f"⚡ شروع بررسی موازی <b>{total}</b> اکانت با پروکسی (۲۰ اکانت همزمان)...\n⏳ لطفاً منتظر بمانید.",
         parse_mode='HTML'
     )
 
     detail_logs = []
+    discount_results = []
+    done = 0
+    last_edit_time = 0
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(20)
 
     def _check_sync(acc_token, ref_token, uid, p_dict, phone):
         proxy_ip = mask_proxy(p_dict)
         log_line = f"[{time.strftime('%H:%M:%S')}] 📱 {phone} | UUID: {uid} | پروکسی: {proxy_ip}\n"
 
-        status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict)
+        status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict, fast_mode=True)
 
         if status == 401 and ref_token:
             log_line += f"  ♻️ توکن منقضی — در حال رفرش...\n"
-            new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict)
+            new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict, fast_mode=True)
             if new_acc:
-                status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict)
+                status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict, fast_mode=True)
                 log_line += f"  ✅ رفرش موفق — بررسی مجدد انجام شد.\n"
                 return status, res, new_acc, new_ref, log_line
             else:
@@ -539,65 +583,71 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 
         return status, res, None, None, log_line
 
-    discount_results = []
-    done = 0
+    async def _worker(key):
+        nonlocal done, last_edit_time
+        phone = key.replace("account:", "")
+        async with sem:
+            try:
+                token_data = await redis_client.hgetall(key)
+                access_token = token_data.get("access_token")
+                refresh_token = token_data.get("refresh_token")
 
-    for key in acc_keys:
-        try:
-            phone = key.replace("account:", "")
-            token_data = await redis_client.hgetall(key)
-            access_token = token_data.get("access_token")
-            refresh_token = token_data.get("refresh_token")
+                if not access_token:
+                    async with lock:
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست، رد شد.\n")
+                        done += 1
+                    return
 
-            if not access_token:
-                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست، رد شد.\n")
-                done += 1
-                continue
+                user_uuid = get_user_id_from_token(access_token)
+                if not user_uuid:
+                    async with lock:
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — UUID قابل استخراج نیست، رد شد.\n")
+                        done += 1
+                    return
 
-            user_uuid = get_user_id_from_token(access_token)
-            if not user_uuid:
-                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — UUID قابل استخراج نیست، رد شد.\n")
-                done += 1
-                continue
+                proxy_dict = pick_proxy_sync(proxies_list)
 
-            proxy_dict = await get_random_proxy_from_db()
+                status, res, new_acc, new_ref, log_line = await loop.run_in_executor(
+                    executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, phone
+                )
 
-            status, res, new_acc, new_ref, log_line = await loop.run_in_executor(
-                executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, phone
-            )
-            detail_logs.append(log_line)
+                if new_acc:
+                    await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
 
-            if new_acc:
-                await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
+                async with lock:
+                    detail_logs.append(log_line)
+                    if status == 200 and isinstance(res, dict):
+                        vouchers = res.get('data', [])
+                        if vouchers:
+                            amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
+                            max_amount = max(amounts) // 10000 if amounts else 0
+                            old_link = phone_to_latest_link.get(phone, "")
+                            discount_results.append({
+                                "phone": phone,
+                                "count": len(vouchers),
+                                "max_amount": max_amount,
+                                "link": old_link
+                            })
 
-            if status == 200 and isinstance(res, dict):
-                vouchers = res.get('data', [])
-                if vouchers:
-                    amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
-                    max_amount = max(amounts) // 10000 if amounts else 0
-                    old_link = phone_to_latest_link.get(phone, "")
-                    discount_results.append({
-                        "phone": phone,
-                        "count": len(vouchers),
-                        "max_amount": max_amount,
-                        "link": old_link
-                    })
+                    done += 1
+                    now = time.time()
+                    if (now - last_edit_time >= 2.0) or (done == total):
+                        last_edit_time = now
+                        try:
+                            await progress_msg.edit_text(
+                                f"⚡ بررسی موازی اکانت‌ها...\n"
+                                f"✅ انجام شده: <b>{done}/{total}</b>\n"
+                                f"🎁 دارای تخفیف تاکنون: <b>{len(discount_results)}</b>",
+                                parse_mode='HTML'
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                async with lock:
+                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
+                    done += 1
 
-            done += 1
-            if done % 5 == 0 or done == total:
-                try:
-                    await progress_msg.edit_text(
-                        f"🔍 بررسی اکانت‌ها...\n"
-                        f"✅ انجام شده: <b>{done}/{total}</b>\n"
-                        f"🎁 دارای تخفیف تاکنون: <b>{len(discount_results)}</b>",
-                        parse_mode='HTML'
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
-            logging.error(f"Discount check error for {key}: {e}")
+    await asyncio.gather(*[_worker(k) for k in acc_keys])
 
     if discount_results:
         report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
@@ -648,7 +698,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         logging.error(f"Error sending log file: {e}")
 
 # ==========================================
-# پردازش فایل زیپ و بررسی تخفیف
+# پردازش فایل زیپ و بررسی تخفیف (موازی)
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -720,14 +770,17 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"✅ <b>تعداد {count} اکانت ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
 
         elif action == 'zip_discount_check':
-            await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها با سیستم ضدربات و رفرش‌توکن. لطفاً منتظر بمانید...")
+            await msg.edit_text(f"⚡ در حال بررسی موازی وضعیت تخفیف {len(json_files_paths)} فایل...")
             discount_dir = os.path.join(temp_dir, "Discount_Accounts")
             os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
             links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
             discount_count = 0
             
-            api = OkalaAPI()
+            proxies_list = await get_all_proxies_from_db()
+            api = OkalaAPI(proxies_list=proxies_list)
             loop = asyncio.get_running_loop()
+            sem = asyncio.Semaphore(20)
+            lock = asyncio.Lock()
 
             raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
             phone_to_latest_link = {}
@@ -738,57 +791,61 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
             
             def _check_sync_zip(acc_token, ref_token, uid, p_dict):
-                status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict)
+                status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict, fast_mode=True)
                 if status == 401 and ref_token:
-                    new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict)
+                    new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict, fast_mode=True)
                     if new_acc:
-                        status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict)
+                        status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict, fast_mode=True)
                         return status, res, new_acc, new_ref
                 return status, res, None, None
             
-            for file_path in json_files_paths:
+            async def _zip_worker(file_path):
+                nonlocal discount_count, links_text
                 filename = os.path.basename(file_path)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                        data = json.loads(file_content)
-                        access_token = None
-                        refresh_token = None
-                        phone = filename.replace('.json', '')
-                        for cookie in data.get('cookies', []):
-                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                            if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-                        if not access_token:
-                            for origin in data.get('origins', []):
-                                for item in origin.get('localStorage', []):
-                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
-                                    if item.get('name') == 'refresh_token': refresh_token = item.get('value')
-                        
-                        if access_token:
-                            user_uuid = get_user_id_from_token(access_token)
-                            if user_uuid:
-                                proxy_dict = await get_random_proxy_from_db()
-                                status, res, new_acc, new_ref = await loop.run_in_executor(
-                                    executor, _check_sync_zip, access_token, refresh_token, user_uuid, proxy_dict
-                                )
-                                
-                                if new_acc:
-                                    data = update_tokens_in_data(data, access_token, new_acc, refresh_token, new_ref)
-                                    file_content = json.dumps(data, ensure_ascii=False)
-                                    with open(file_path, 'w', encoding='utf-8') as fw:
-                                        fw.write(file_content)
-
-                                if status == 200 and isinstance(res, dict):
-                                    vouchers = res.get('data', [])
-                                    if vouchers:
-                                        discount_count += 1
-                                        shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
-                                        old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
-                                        links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
+                async with sem:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                            data = json.loads(file_content)
+                            access_token = None
+                            refresh_token = None
+                            phone = filename.replace('.json', '')
+                            for cookie in data.get('cookies', []):
+                                if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                                if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+                            if not access_token:
+                                for origin in data.get('origins', []):
+                                    for item in origin.get('localStorage', []):
+                                        if item.get('name') == 'tokenMS': access_token = item.get('value')
+                                        if item.get('name') == 'refresh_token': refresh_token = item.get('value')
+                            
+                            if access_token:
+                                user_uuid = get_user_id_from_token(access_token)
+                                if user_uuid:
+                                    proxy_dict = pick_proxy_sync(proxies_list)
+                                    status, res, new_acc, new_ref = await loop.run_in_executor(
+                                        executor, _check_sync_zip, access_token, refresh_token, user_uuid, proxy_dict
+                                    )
                                     
-                except Exception as e:
-                    api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
-                    
+                                    if new_acc:
+                                        data = update_tokens_in_data(data, access_token, new_acc, refresh_token, new_ref)
+                                        file_content = json.dumps(data, ensure_ascii=False)
+                                        with open(file_path, 'w', encoding='utf-8') as fw:
+                                            fw.write(file_content)
+
+                                    if status == 200 and isinstance(res, dict):
+                                        vouchers = res.get('data', [])
+                                        if vouchers:
+                                            async with lock:
+                                                discount_count += 1
+                                                shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
+                                                old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
+                                                links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
+                    except Exception as e:
+                        async with lock:
+                            api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
+
+            await asyncio.gather(*[_zip_worker(fp) for fp in json_files_paths])
             debug_logs = api.request_logs
             
             if discount_count > 0:
@@ -1168,7 +1225,6 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc_keys:
             await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
             return
-        await context.bot.send_message(chat_id=user_id, text="⏳ در حال پردازش دیتابیس با سیستم ضدربات (پروکسی). لطفاً منتظر بمانید...")
         asyncio.create_task(process_discounts_and_send_report(context.bot, user_id, acc_keys))
 
     elif data == "admin_extract_raw":
@@ -1552,7 +1608,8 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
             else:
                 await msg.edit_text("🔍 اکانت از قبل نام دارد. در حال بررسی دقیق سوابق خرید...")
                 
-                api = OkalaAPI(custom_headers=get_user_headers(context))
+                proxies_list = await get_all_proxies_from_db()
+                api = OkalaAPI(custom_headers=get_user_headers(context), proxies_list=proxies_list)
                 success, has_orders, order_count, ord_status, raw_resp = await loop.run_in_executor(
                     executor,
                     check_order_history_sync, api, access_token, proxy_dict
